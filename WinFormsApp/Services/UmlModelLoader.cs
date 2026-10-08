@@ -1,4 +1,7 @@
-﻿using System.Xml.Linq;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Xml.Linq;
 using WinFormsApp.Models;
 
 namespace WinFormsApp.Services
@@ -8,179 +11,170 @@ namespace WinFormsApp.Services
         private static readonly XNamespace Xmi =
             "http://www.omg.org/spec/XMI/20131001";
 
-
         private static readonly XNamespace Uml =
             "http://www.eclipse.org/uml2/5.0.0/UML";
 
-
-        public UmlModel Load(string fileName)
+        public UmlModel Load(string filePath)
         {
-            if (!File.Exists(fileName))
-            {
-                throw new FileNotFoundException(
-                    "Arquivo UML não encontrado.",
-                    fileName);
-            }
+            XDocument document = XDocument.Load(filePath);
 
-
-            XDocument document =
-                XDocument.Load(fileName);
-
-
-            XElement? modelElement =
-                document
-                    .Descendants(Uml + "Model")
-                    .FirstOrDefault();
-
+            XElement modelElement =
+                document.Descendants(Uml + "Model").FirstOrDefault();
 
             if (modelElement == null)
+                throw new Exception(
+                    "Não foi encontrado um elemento uml:Model no arquivo UML.");
+
+            var model = new UmlModel(
+                GetXmiId(modelElement),
+                "uml:Model",
+                modelElement.Attribute("name")?.Value);
+
+            // Primeiro constrói a árvore UML.
+            foreach (var child in modelElement.Elements())
             {
-                throw new InvalidOperationException(
-                    "O arquivo não possui um elemento uml:Model.");
+                if (IsUmlElement(child))
+                {
+                    LoadElement(child, model);
+                }
             }
 
-
-            string? id =
-                GetAttribute(
-                    modelElement,
-                    Xmi,
-                    "id");
-
-
-            string? name =
-                GetAttribute(
-                    modelElement,
-                    null,
-                    "name");
-
-
-            UmlModel model =
-                new UmlModel(
-                    id,
-                    "uml:Model",
-                    name);
-
-
-            foreach (
-                XElement child
-                in modelElement.Elements())
-            {
-                LoadElement(
-                    child,
-                    model);
-            }
-
+            // Depois processa os estereótipos aplicados.
+            LoadAppliedStereotypes(document, model);
 
             return model;
         }
-
 
         private void LoadElement(
             XElement xmlElement,
             UmlElement parent)
         {
-            XAttribute? typeAttribute =
-                xmlElement.Attribute(
-                    Xmi + "type");
+            string type = GetXmiType(xmlElement);
 
-
-            // Elementos sem xmi:type podem ser apenas
-            // contêineres XML. Continuamos procurando
-            // elementos UML dentro deles.
-
-            if (typeAttribute == null)
-            {
-                foreach (
-                    XElement child
-                    in xmlElement.Elements())
-                {
-                    LoadElement(
-                        child,
-                        parent);
-                }
-
+            if (string.IsNullOrWhiteSpace(type))
                 return;
-            }
 
-
-            string type =
-                typeAttribute.Value;
-
-
-            // Nesta versão estamos interessados somente
-            // nos elementos UML.
-            //
-            // Ignora, por exemplo:
-            //
-            // ecore:EAnnotation
-            // ecore:EStringToStringMapEntry
-
-            if (!type.StartsWith("uml:"))
-            {
+            // Só carregamos elementos UML.
+            if (!type.StartsWith("uml:", StringComparison.OrdinalIgnoreCase))
                 return;
-            }
 
+            string id = GetXmiId(xmlElement);
+            string name = xmlElement.Attribute("name")?.Value;
 
-            string? id =
-                GetAttribute(
-                    xmlElement,
-                    Xmi,
-                    "id");
-
-
-            string? name =
-                GetAttribute(
-                    xmlElement,
-                    null,
-                    "name");
-
-
-            UmlElement element =
-                new UmlElement(
-                    id,
-                    type,
-                    name);
-
+            var element = new UmlElement(
+                id,
+                type,
+                name);
 
             element.Parent = parent;
 
             parent.Children.Add(element);
 
-
-            foreach (
-                XElement child
-                in xmlElement.Elements())
+            foreach (var child in xmlElement.Elements())
             {
-                LoadElement(
-                    child,
-                    element);
+                if (IsUmlElement(child))
+                {
+                    LoadElement(child, element);
+                }
             }
         }
 
-
-        private string? GetAttribute(
-            XElement element,
-            XNamespace? namespaceName,
-            string attributeName)
+        private void LoadAppliedStereotypes(
+            XDocument document,
+            UmlModel model)
         {
-            XAttribute? attribute;
+            var elementsById = model
+                .AllOwnedElements()
+                .Append(model)
+                .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+                .GroupBy(x => x.Id)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.First());
 
-
-            if (namespaceName == null)
+            foreach (var element in document.Root.Elements())
             {
-                attribute =
-                    element.Attribute(
-                        attributeName);
+                ProcessStereotypeElement(
+                    element,
+                    elementsById);
             }
-            else
+        }
+
+        private void ProcessStereotypeElement(
+            XElement element,
+            Dictionary<string, UmlElement> elementsById)
+        {
+            string localName = element.Name.LocalName;
+
+            // Elementos uml:* já foram tratados pela árvore.
+            if (element.Name.Namespace == Uml)
+                return;
+
+            string xmiId = GetXmiId(element);
+
+            if (!string.IsNullOrWhiteSpace(xmiId))
             {
-                attribute =
-                    element.Attribute(
-                        namespaceName + attributeName);
+                // Procura uma referência do tipo:
+                //
+                // base_Classifier="..."
+                // base_Operation="..."
+                // base_Class="..."
+                // base_TimeEvent="..."
+                //
+                // O alvo dessa referência é o elemento UML que recebeu
+                // o estereótipo.
+
+                foreach (var attribute in element.Attributes())
+                {
+                    if (!attribute.Name.LocalName.StartsWith(
+                            "base_",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string targetId = attribute.Value;
+
+                    if (elementsById.TryGetValue(
+                            targetId,
+                            out UmlElement target))
+                    {
+                        target.AppliedStereotypes.Add(localName);
+
+                        target.References[attribute.Name.LocalName] =
+                            targetId;
+                    }
+                }
             }
 
+            // Alguns elementos de estereótipo podem possuir conteúdo
+            // interno relevante.
+            foreach (var child in element.Elements())
+            {
+                ProcessStereotypeElement(
+                    child,
+                    elementsById);
+            }
+        }
 
-            return attribute?.Value;
+        private bool IsUmlElement(XElement element)
+        {
+            string type = GetXmiType(element);
+
+            return !string.IsNullOrWhiteSpace(type)
+                   && type.StartsWith(
+                       "uml:",
+                       StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string GetXmiType(XElement element)
+        {
+            return element.Attribute(Xmi + "type")?.Value;
+        }
+
+        private string GetXmiId(XElement element)
+        {
+            return element.Attribute(Xmi + "id")?.Value;
         }
     }
 }
